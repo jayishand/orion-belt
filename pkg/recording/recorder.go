@@ -5,13 +5,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/zrougamed/orion-belt/pkg/common"
 )
 
-// Recorder handles SSH session recording
+// ANSI regex to strip terminal colors and cursor movements
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
 type Recorder struct {
 	storagePath string
 	logger      *common.Logger
@@ -23,16 +26,8 @@ type Recorder struct {
 type SessionRecorder struct {
 	sessionID string
 	file      *os.File
-	writer    io.Writer
 	startTime time.Time
 	mu        sync.Mutex
-}
-
-// RecordEntry represents a recorded entry in the session
-type RecordEntry struct {
-	Timestamp time.Time `json:"timestamp"`
-	Data      []byte    `json:"data"`
-	Direction string    `json:"direction"` // input or output
 }
 
 // NewRecorder creates a new session recorder
@@ -60,7 +55,7 @@ func (r *Recorder) StartRecording(sessionID string) (*SessionRecorder, error) {
 	}
 
 	// Create session file
-	filename := filepath.Join(r.storagePath, fmt.Sprintf("%s.log", sessionID))
+	filename := r.GetRecordingPath(sessionID)
 	file, err := os.Create(filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create recording file: %w", err)
@@ -69,7 +64,6 @@ func (r *Recorder) StartRecording(sessionID string) (*SessionRecorder, error) {
 	recorder := &SessionRecorder{
 		sessionID: sessionID,
 		file:      file,
-		writer:    file,
 		startTime: time.Now(),
 	}
 
@@ -124,43 +118,30 @@ func (r *Recorder) GetRecorder(sessionID string) (*SessionRecorder, error) {
 	return recorder, nil
 }
 
+// GetRecordingStoragePath returns the path to the recorder storage path
+func (r *Recorder) GetRecordingStoragePath() string {
+	return r.storagePath
+}
+
 // GetRecordingPath returns the path to a session recording
 func (r *Recorder) GetRecordingPath(sessionID string) string {
-	return filepath.Join(r.storagePath, fmt.Sprintf("%s.log", sessionID))
+	return filepath.Join(r.storagePath, fmt.Sprintf("%s.txt", sessionID))
 }
 
 // Write writes data to the session recording
-func (s *SessionRecorder) Write(data []byte, direction string) error {
+func (s *SessionRecorder) Write(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	timestamp := time.Now().Format(time.RFC3339Nano)
-	entry := fmt.Sprintf("[%s] [%s] %s\n", timestamp, direction, string(data))
+	// Strip ANSI codes (colors, bold, etc.) to keep the text clean
+	cleanData := ansiRegex.ReplaceAll(data, []byte(""))
 
-	_, err := s.file.WriteString(entry)
+	_, err := s.file.Write(cleanData)
 	if err != nil {
 		return fmt.Errorf("failed to write to recording: %w", err)
 	}
 
 	return nil
-}
-
-// WriteInput writes input data (from client)
-func (s *SessionRecorder) WriteInput(data []byte) error {
-	return s.Write(data, "input")
-}
-
-// WriteOutput writes output data (from server)
-func (s *SessionRecorder) WriteOutput(data []byte) error {
-	return s.Write(data, "output")
-}
-
-// Flush flushes the recording to disk
-func (s *SessionRecorder) Flush() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.file.Sync()
 }
 
 // RecordingWriter wraps an io.Writer to record data
@@ -180,7 +161,7 @@ func NewRecordingWriter(writer io.Writer, recorder *SessionRecorder) *RecordingW
 // Write writes data and records it
 func (rw *RecordingWriter) Write(p []byte) (n int, err error) {
 	// Record the data
-	if err := rw.recorder.WriteOutput(p); err != nil {
+	if err := rw.recorder.Write(p); err != nil {
 		// Log error but don't fail the write
 		fmt.Fprintf(os.Stderr, "Recording error: %v\n", err)
 	}
@@ -191,30 +172,17 @@ func (rw *RecordingWriter) Write(p []byte) (n int, err error) {
 
 // RecordingReader wraps an io.Reader to record data
 type RecordingReader struct {
-	reader   io.Reader
-	recorder *SessionRecorder
+	reader io.Reader
 }
 
 // NewRecordingReader creates a new recording reader
 func NewRecordingReader(reader io.Reader, recorder *SessionRecorder) *RecordingReader {
 	return &RecordingReader{
-		reader:   reader,
-		recorder: recorder,
+		reader: reader,
 	}
 }
 
 // Read reads data and records it
 func (rr *RecordingReader) Read(p []byte) (n int, err error) {
-	// Read from actual reader
-	n, err = rr.reader.Read(p)
-
-	// Record the data
-	if n > 0 {
-		if err := rr.recorder.WriteInput(p[:n]); err != nil {
-			// Log error but don't fail the read
-			fmt.Fprintf(os.Stderr, "Recording error: %v\n", err)
-		}
-	}
-
-	return n, err
+	return rr.reader.Read(p)
 }

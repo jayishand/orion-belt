@@ -109,6 +109,27 @@ func (s *PostgresStore) Migrate(ctx context.Context) error {
 			ip_address VARCHAR(45) NOT NULL,
 			timestamp TIMESTAMP NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS api_keys (
+			id VARCHAR(36) PRIMARY KEY,
+			user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name VARCHAR(255) NOT NULL,
+			key_hash VARCHAR(64) NOT NULL UNIQUE,
+			key_prefix VARCHAR(16) NOT NULL,
+			last_used_at TIMESTAMP,
+			expires_at TIMESTAMP,
+			created_at TIMESTAMP NOT NULL,
+			revoked_at TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS http_sessions (
+			id VARCHAR(36) PRIMARY KEY,
+			user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			token_hash VARCHAR(64) NOT NULL UNIQUE,
+			ip_address VARCHAR(45) NOT NULL,
+			user_agent TEXT,
+			expires_at TIMESTAMP NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			last_seen_at TIMESTAMP NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_machine_id ON sessions(machine_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)`,
@@ -116,6 +137,12 @@ func (s *PostgresStore) Migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_permissions_machine_id ON permissions(machine_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp)`,
+		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_http_sessions_user_id ON http_sessions(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_http_sessions_token_hash ON http_sessions(token_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_http_sessions_expires_at ON http_sessions(expires_at)`,
 	}
 
 	for _, migration := range migrations {
@@ -780,4 +807,257 @@ func (s *PostgresStore) ListAuditLogs(ctx context.Context, limit, offset int, fi
 	}
 
 	return logs, nil
+}
+
+// GetSessionDetails retrieves a session with user and machine names
+func (s *PostgresStore) GetSessionDetails(ctx context.Context, id string) (map[string]interface{}, error) {
+	query := `
+        SELECT 
+            s.id, s.start_time, s.end_time, s.recording_path, s.status,
+            u.username, u.email,
+            m.name as machine_name, m.hostname
+        FROM sessions s
+        JOIN users u ON s.user_id = u.id
+        JOIN machines m ON s.machine_id = m.id
+        WHERE s.id = $1`
+
+	var startTime time.Time
+	var endTime sql.NullTime
+	var idStr, path, status, username, email, mName, mHost string
+
+	err := s.db.QueryRowContext(ctx, query, id).Scan(
+		&idStr, &startTime, &endTime, &path, &status,
+		&username, &email, &mName, &mHost,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get session details: %w", err)
+	}
+
+	return map[string]interface{}{
+		"id":             idStr,
+		"username":       username,
+		"machine_name":   mName,
+		"hostname":       mHost,
+		"start_time":     startTime,
+		"end_time":       endTime.Time,
+		"recording_path": path,
+		"status":         status,
+	}, nil
+}
+
+func (s *PostgresStore) ListUserSessionsWithMachineNames(ctx context.Context, userID string, limit, offset int) ([]map[string]interface{}, error) {
+	query := `
+        SELECT s.id, s.start_time, s.status, m.name
+        FROM sessions s
+        JOIN machines m ON s.machine_id = m.id
+        WHERE s.user_id = $1 
+        ORDER BY s.start_time DESC LIMIT $2 OFFSET $3`
+
+	rows, err := s.db.QueryContext(ctx, query, userID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var id, status, machineName string
+		var start time.Time
+		rows.Scan(&id, &start, &status, &machineName)
+		results = append(results, map[string]interface{}{
+			"id":           id,
+			"start_time":   start,
+			"status":       status,
+			"machine_name": machineName,
+		})
+	}
+	return results, nil
+}
+
+// CreateAPIKey creates a new API key
+func (s *PostgresStore) CreateAPIKey(ctx context.Context, key *common.APIKey) error {
+	query := `
+		INSERT INTO api_keys (id, user_id, name, key_hash, key_prefix, expires_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		key.ID, key.UserID, key.Name, key.KeyHash, key.KeyPrefix, key.ExpiresAt, key.CreatedAt)
+	return err
+}
+
+// GetAPIKey retrieves an API key by ID
+func (s *PostgresStore) GetAPIKey(ctx context.Context, id string) (*common.APIKey, error) {
+	query := `
+		SELECT id, user_id, name, key_hash, key_prefix, last_used_at, expires_at, created_at, revoked_at
+		FROM api_keys
+		WHERE id = $1
+	`
+
+	key := &common.APIKey{}
+	err := s.db.QueryRowContext(ctx, query, id).Scan(
+		&key.ID, &key.UserID, &key.Name, &key.KeyHash, &key.KeyPrefix,
+		&key.LastUsedAt, &key.ExpiresAt, &key.CreatedAt, &key.RevokedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	return key, err
+}
+
+// GetAPIKeyByHash retrieves an API key by its hash
+func (s *PostgresStore) GetAPIKeyByHash(ctx context.Context, keyHash string) (*common.APIKey, error) {
+	query := `
+		SELECT id, user_id, name, key_hash, key_prefix, last_used_at, expires_at, created_at, revoked_at
+		FROM api_keys
+		WHERE key_hash = $1 AND revoked_at IS NULL
+	`
+
+	key := &common.APIKey{}
+	err := s.db.QueryRowContext(ctx, query, keyHash).Scan(
+		&key.ID, &key.UserID, &key.Name, &key.KeyHash, &key.KeyPrefix,
+		&key.LastUsedAt, &key.ExpiresAt, &key.CreatedAt, &key.RevokedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	return key, err
+}
+
+// ListUserAPIKeys retrieves all API keys for a user
+func (s *PostgresStore) ListUserAPIKeys(ctx context.Context, userID string) ([]*common.APIKey, error) {
+	query := `
+		SELECT id, user_id, name, key_hash, key_prefix, last_used_at, expires_at, created_at, revoked_at
+		FROM api_keys
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []*common.APIKey
+	for rows.Next() {
+		key := &common.APIKey{}
+		err := rows.Scan(
+			&key.ID, &key.UserID, &key.Name, &key.KeyHash, &key.KeyPrefix,
+			&key.LastUsedAt, &key.ExpiresAt, &key.CreatedAt, &key.RevokedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+
+	return keys, rows.Err()
+}
+
+// UpdateAPIKeyLastUsed updates the last used timestamp for an API key
+func (s *PostgresStore) UpdateAPIKeyLastUsed(ctx context.Context, id string, lastUsedAt time.Time) error {
+	query := `UPDATE api_keys SET last_used_at = $1 WHERE id = $2`
+	_, err := s.db.ExecContext(ctx, query, lastUsedAt, id)
+	return err
+}
+
+// RevokeAPIKey marks an API key as revoked
+func (s *PostgresStore) RevokeAPIKey(ctx context.Context, id string) error {
+	query := `UPDATE api_keys SET revoked_at = $1 WHERE id = $2`
+	_, err := s.db.ExecContext(ctx, query, time.Now(), id)
+	return err
+}
+
+// DeleteAPIKey permanently deletes an API key
+func (s *PostgresStore) DeleteAPIKey(ctx context.Context, id string) error {
+	query := `DELETE FROM api_keys WHERE id = $1`
+	_, err := s.db.ExecContext(ctx, query, id)
+	return err
+}
+
+// CreateHTTPSession creates a new HTTP session
+func (s *PostgresStore) CreateHTTPSession(ctx context.Context, session *common.HTTPSession) error {
+	query := `
+		INSERT INTO http_sessions (id, user_id, token_hash, ip_address, user_agent, expires_at, created_at, last_seen_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		session.ID, session.UserID, session.Token, session.IPAddress, session.UserAgent,
+		session.ExpiresAt, session.CreatedAt, session.LastSeenAt)
+	return err
+}
+
+// GetHTTPSession retrieves an HTTP session by ID
+func (s *PostgresStore) GetHTTPSession(ctx context.Context, id string) (*common.HTTPSession, error) {
+	query := `
+		SELECT id, user_id, token_hash, ip_address, user_agent, expires_at, created_at, last_seen_at
+		FROM http_sessions
+		WHERE id = $1
+	`
+
+	session := &common.HTTPSession{}
+	err := s.db.QueryRowContext(ctx, query, id).Scan(
+		&session.ID, &session.UserID, &session.Token, &session.IPAddress,
+		&session.UserAgent, &session.ExpiresAt, &session.CreatedAt, &session.LastSeenAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	return session, err
+}
+
+// GetHTTPSessionByToken retrieves an HTTP session by its token hash
+func (s *PostgresStore) GetHTTPSessionByToken(ctx context.Context, tokenHash string) (*common.HTTPSession, error) {
+	query := `
+		SELECT id, user_id, token_hash, ip_address, user_agent, expires_at, created_at, last_seen_at
+		FROM http_sessions
+		WHERE token_hash = $1 AND expires_at > NOW()
+	`
+
+	session := &common.HTTPSession{}
+	err := s.db.QueryRowContext(ctx, query, tokenHash).Scan(
+		&session.ID, &session.UserID, &session.Token, &session.IPAddress,
+		&session.UserAgent, &session.ExpiresAt, &session.CreatedAt, &session.LastSeenAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	return session, err
+}
+
+// UpdateHTTPSessionLastSeen updates the last seen timestamp for an HTTP session
+func (s *PostgresStore) UpdateHTTPSessionLastSeen(ctx context.Context, id string, lastSeenAt time.Time) error {
+	query := `UPDATE http_sessions SET last_seen_at = $1 WHERE id = $2`
+	_, err := s.db.ExecContext(ctx, query, lastSeenAt, id)
+	return err
+}
+
+// DeleteHTTPSession deletes an HTTP session
+func (s *PostgresStore) DeleteHTTPSession(ctx context.Context, id string) error {
+	query := `DELETE FROM http_sessions WHERE id = $1`
+	_, err := s.db.ExecContext(ctx, query, id)
+	return err
+}
+
+// DeleteExpiredHTTPSessions deletes all expired HTTP sessions
+func (s *PostgresStore) DeleteExpiredHTTPSessions(ctx context.Context) error {
+	query := `DELETE FROM http_sessions WHERE expires_at < NOW()`
+	result, err := s.db.ExecContext(ctx, query)
+	if err != nil {
+		return err
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected > 0 {
+		fmt.Printf("Cleaned up %d expired sessions\n", rowsAffected)
+	}
+	return nil
 }

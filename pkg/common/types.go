@@ -1,6 +1,8 @@
 package common
 
 import (
+	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,7 +28,7 @@ type Machine struct {
 	Tags       map[string]string `json:"tags"`
 	AgentID    string            `json:"agent_id"`
 	IsActive   bool              `json:"is_active"`
-	LastSeenAt *time.Time        `json:"last_seen_at,omitempty"` // Pointer to handle NULL
+	LastSeenAt *time.Time        `json:"last_seen_at,omitempty"`
 	CreatedAt  time.Time         `json:"created_at"`
 	UpdatedAt  time.Time         `json:"updated_at"`
 }
@@ -79,6 +81,31 @@ type AuditLog struct {
 	Timestamp time.Time              `json:"timestamp"`
 }
 
+// APIKey represents an API key for authentication
+type APIKey struct {
+	ID         string     `json:"id"`
+	UserID     string     `json:"user_id"`
+	Name       string     `json:"name"`       // Human-readable name for the key
+	KeyHash    string     `json:"-"`          // SHA256 hash of the actual key
+	KeyPrefix  string     `json:"key_prefix"` // First 8 chars for identification
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+}
+
+// HTTPSession represents an HTTP session
+type HTTPSession struct {
+	ID         string    `json:"id"`
+	UserID     string    `json:"user_id"`
+	Token      string    `json:"-"`
+	IPAddress  string    `json:"ip_address"`
+	UserAgent  string    `json:"user_agent"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+}
+
 // NewUser creates a new user
 func NewUser(username, email, publicKey string, isAdmin bool) *User {
 	now := time.Now()
@@ -109,9 +136,11 @@ func NewMachine(name, hostname string, port int, tags map[string]string) *Machin
 }
 
 // NewSession creates a new session
-func NewSession(userID, machineID, recordingPath string) *Session {
+func NewSession(userID, machineID, storagePath string) *Session {
+	sessionID := uuid.New().String()
+	recordingPath := filepath.Join(storagePath, fmt.Sprintf("%s.txt", sessionID))
 	return &Session{
-		ID:            uuid.New().String(),
+		ID:            sessionID,
 		UserID:        userID,
 		MachineID:     machineID,
 		StartTime:     time.Now(),
@@ -157,5 +186,33 @@ func NewAuditLog(userID, action, resource, ipAddress string, metadata map[string
 		Metadata:  metadata,
 		IPAddress: ipAddress,
 		Timestamp: time.Now(),
+	}
+}
+
+// NewAPIKey creates a new API key
+func NewAPIKey(userID, name, keyHash, keyPrefix string, expiresAt *time.Time) *APIKey {
+	return &APIKey{
+		ID:        uuid.New().String(),
+		UserID:    userID,
+		Name:      name,
+		KeyHash:   keyHash,
+		KeyPrefix: keyPrefix,
+		ExpiresAt: expiresAt,
+		CreatedAt: time.Now(),
+	}
+}
+
+// NewHTTPSession creates a new HTTP session
+func NewHTTPSession(userID, token, ipAddress, userAgent string, expiresAt time.Time) *HTTPSession {
+	now := time.Now()
+	return &HTTPSession{
+		ID:         uuid.New().String(),
+		UserID:     userID,
+		Token:      token,
+		IPAddress:  ipAddress,
+		UserAgent:  userAgent,
+		ExpiresAt:  expiresAt,
+		CreatedAt:  now,
+		LastSeenAt: now,
 	}
 }

@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"time"
@@ -191,7 +194,7 @@ func GenerateSSHKeyPair() (privateKey, publicKey string, err error) {
 		return "", "", fmt.Errorf("failed to generate key pair: %w", err)
 	}
 
-	// Encode private key to PEM
+	// TODO: implement support for ECDSA, Ed25519, Ed448, FIDO
 	privateKeyPEM := &pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
@@ -211,4 +214,123 @@ func GenerateSSHKeyPair() (privateKey, publicKey string, err error) {
 // keyEquals compares two SSH public keys
 func keyEquals(a, b ssh.PublicKey) bool {
 	return string(a.Marshal()) == string(b.Marshal())
+}
+
+// GenerateAPIKey creates a new API key for a user
+func (a *AuthService) GenerateAPIKey(ctx context.Context, userID, name string, expiresAt *time.Time) (*common.APIKey, string, error) {
+	// Generate a cryptographically secure random key
+	rawKey, err := generateSecureToken(32)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to generate API key: %w", err)
+	}
+
+	// Hash the key for storage
+	keyHash := hashKey(rawKey)
+
+	// Store only the prefix for display (first 8 chars)
+	keyPrefix := rawKey[:8]
+
+	// Create the API key record
+	apiKey := common.NewAPIKey(userID, name, keyHash, keyPrefix, expiresAt)
+
+	// Save to database
+	if err := a.store.CreateAPIKey(ctx, apiKey); err != nil {
+		return nil, "", fmt.Errorf("failed to create API key: %w", err)
+	}
+
+	a.logger.Info("API key created: user=%s name=%s prefix=%s", userID, name, keyPrefix)
+
+	// Return the API key record and the raw key
+	return apiKey, rawKey, nil
+}
+
+// RevokeAPIKey revokes an API key
+func (a *AuthService) RevokeAPIKey(ctx context.Context, keyID string) error {
+	if err := a.store.RevokeAPIKey(ctx, keyID); err != nil {
+		return fmt.Errorf("failed to revoke API key: %w", err)
+	}
+
+	a.logger.Info("API key revoked: %s", keyID)
+	return nil
+}
+
+// ListUserAPIKeys returns all API keys for a user
+func (a *AuthService) ListUserAPIKeys(ctx context.Context, userID string) ([]*common.APIKey, error) {
+	keys, err := a.store.ListUserAPIKeys(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list API keys: %w", err)
+	}
+	return keys, nil
+}
+
+// CreateSession creates a new HTTP session for a user
+func (a *AuthService) CreateSession(ctx context.Context, userID, ipAddress, userAgent string, duration time.Duration) (*common.HTTPSession, string, error) {
+	// Generate a cryptographically secure session token
+	rawToken, err := generateSecureToken(32)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to generate session token: %w", err)
+	}
+
+	// Hash the token for storage
+	tokenHash := hashKey(rawToken)
+
+	// Calculate expiration
+	expiresAt := time.Now().Add(duration)
+
+	// Create the session record
+	session := common.NewHTTPSession(userID, tokenHash, ipAddress, userAgent, expiresAt)
+
+	// Save to database
+	if err := a.store.CreateHTTPSession(ctx, session); err != nil {
+		return nil, "", fmt.Errorf("failed to create session: %w", err)
+	}
+
+	a.logger.Info("HTTP session created: user=%s ip=%s duration=%v", userID, ipAddress, duration)
+
+	return session, rawToken, nil
+}
+
+// DestroySession destroys an HTTP session
+func (a *AuthService) DestroySession(ctx context.Context, sessionID string) error {
+	if err := a.store.DeleteHTTPSession(ctx, sessionID); err != nil {
+		return fmt.Errorf("failed to destroy session: %w", err)
+	}
+
+	a.logger.Info("HTTP session destroyed: %s", sessionID)
+	return nil
+}
+
+// CleanupExpiredSessions removes all expired HTTP sessions
+func (a *AuthService) CleanupExpiredSessions(ctx context.Context) error {
+	if err := a.store.DeleteExpiredHTTPSessions(ctx); err != nil {
+		return fmt.Errorf("failed to cleanup expired sessions: %w", err)
+	}
+	return nil
+}
+
+// generateSecureToken generates a cryptographically secure random token
+func generateSecureToken(length int) (string, error) {
+	bytes := make([]byte, length)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	// Use base64 URL encoding (safe for URLs and headers)
+	return base64.URLEncoding.EncodeToString(bytes), nil
+}
+
+// hashKey creates a SHA256 hash of a key/token
+func hashKey(key string) string {
+	hash := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(hash[:])
+}
+
+// ValidateAPIKeyFormat checks if an API key has the correct format
+func ValidateAPIKeyFormat(key string) bool {
+	// Decode from base64
+	decoded, err := base64.URLEncoding.DecodeString(key)
+	if err != nil {
+		return false
+	}
+	// Should be 32 bytes
+	return len(decoded) == 32
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/zrougamed/orion-belt/pkg/common"
 	"golang.org/x/crypto/ssh"
@@ -44,7 +45,7 @@ func (c *SSHClient) Connect(target string, username string) error {
 	if username == "" {
 		username = os.Getenv("USER")
 		if username == "" {
-			username = "root" // Default for Docker containers
+			username = "root"
 		}
 	}
 
@@ -103,9 +104,17 @@ func (c *SSHClient) Connect(target string, username string) error {
 	session.Stderr = os.Stderr
 	session.Stdin = os.Stdin
 
-	// Run shell with target as argument
-	if err := session.Run(target); err != nil {
-		return fmt.Errorf("session error: %w", err)
+	// Start shell with target as argument
+	if err := session.Start(target); err != nil {
+		return fmt.Errorf("failed to start session: %w", err)
+	}
+
+	err = session.Wait()
+	if err != nil {
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			os.Exit(exitErr.ExitStatus())
+		}
+		return fmt.Errorf("session wait error: %w", err)
 	}
 
 	return nil
@@ -116,7 +125,6 @@ func (c *SSHClient) RequestAccess(target, reason string, duration int) error {
 	c.logger.Info("Requesting access to %s for %d seconds", target, duration)
 
 	// TODO: Implement API call to request access
-	// This would make an HTTP request to the server's API endpoint
 
 	fmt.Printf("Access request submitted for %s\n", target)
 	fmt.Printf("Reason: %s\n", reason)
@@ -150,9 +158,28 @@ func NewSCPClient(config *common.Config, logger *common.Logger) (*SCPClient, err
 
 // Copy copies a file through the Orion-Belt server
 func (c *SCPClient) Copy(source, destination string, isUpload bool) error {
-	c.logger.Info("Copying %s to %s", source, destination)
+	var machine, remotePath, localPath string
 
-	// Load SSH key
+	if isUpload {
+		localPath = source
+		parts := splitMachinePath(destination)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid destination format, expected machine:path, got: %s", destination)
+		}
+		machine = parts[0]
+		remotePath = parts[1]
+	} else {
+		localPath = destination
+		parts := splitMachinePath(source)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid source format, expected machine:path, got: %s", source)
+		}
+		machine = parts[0]
+		remotePath = parts[1]
+	}
+
+	localPath = expandLocalPath(localPath)
+
 	keyData, err := os.ReadFile(c.config.Auth.KeyFile)
 	if err != nil {
 		return fmt.Errorf("failed to read SSH key: %w", err)
@@ -174,6 +201,7 @@ func (c *SCPClient) Copy(source, destination string, isUpload bool) error {
 
 	// Connect to Orion-Belt server
 	serverAddr := fmt.Sprintf("%s:%d", c.config.Server.Host, c.config.Server.Port)
+	c.logger.Debug("Connecting to server %s", serverAddr)
 	client, err := ssh.Dial("tcp", serverAddr, config)
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
@@ -188,13 +216,25 @@ func (c *SCPClient) Copy(source, destination string, isUpload bool) error {
 	defer session.Close()
 
 	if isUpload {
-		return c.uploadFile(session, source, destination)
+		return c.uploadFile(session, localPath, machine, remotePath)
 	}
-	return c.downloadFile(session, source, destination)
+	return c.downloadFile(session, localPath, machine, remotePath)
+}
+
+func expandLocalPath(path string) string {
+	if path == "." || path == "./" {
+		wd, _ := os.Getwd()
+		return wd
+	}
+	if len(path) > 0 && path[0] == '~' {
+		home, _ := os.UserHomeDir()
+		return home + path[1:]
+	}
+	return path
 }
 
 // uploadFile uploads a file to the remote machine
-func (c *SCPClient) uploadFile(session *ssh.Session, source, destination string) error {
+func (c *SCPClient) uploadFile(session *ssh.Session, source, machine, remotePath string) error {
 	file, err := os.Open(source)
 	if err != nil {
 		return fmt.Errorf("failed to open source file: %w", err)
@@ -227,8 +267,9 @@ func (c *SCPClient) uploadFile(session *ssh.Session, source, destination string)
 	}()
 
 	// Run SCP command
-	if err := session.Run(fmt.Sprintf("scp -t %s", destination)); err != nil {
-		return fmt.Errorf("scp failed: %w", err)
+	scpCmd := fmt.Sprintf("%s scp -t %s", machine, remotePath)
+	if err := session.Run(scpCmd); err != nil {
+		return fmt.Errorf("scp upload failed: %w", err)
 	}
 
 	c.logger.Info("File uploaded successfully")
@@ -236,32 +277,76 @@ func (c *SCPClient) uploadFile(session *ssh.Session, source, destination string)
 }
 
 // downloadFile downloads a file from the remote machine
-func (c *SCPClient) downloadFile(session *ssh.Session, source, destination string) error {
-	file, err := os.Create(destination)
+func (c *SCPClient) downloadFile(session *ssh.Session, destination, machine, remotePath string) error {
+	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("failed to create destination file: %w", err)
+		return err
+	}
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return err
+	}
+
+	scpCmd := fmt.Sprintf("%s scp -f %s", machine, remotePath)
+	if err := session.Start(scpCmd); err != nil {
+		return err
+	}
+
+	fmt.Fprint(stdin, "\x00")
+	var header string
+	buf := make([]byte, 1)
+	for {
+		_, err := stdout.Read(buf)
+		if err != nil || buf[0] == '\n' {
+			break
+		}
+		header += string(buf)
+	}
+
+	if len(header) == 0 {
+		return fmt.Errorf("failed to read SCP header (empty response)")
+	}
+	var perms string
+	var size int64
+	var filename string
+	_, err = fmt.Sscanf(header, "C%s %d %s", &perms, &size, &filename)
+	if err != nil {
+		return fmt.Errorf("failed to parse SCP header '%s': %w", header, err)
+	}
+
+	finalLocalPath := destination
+	info, err := os.Stat(destination)
+	if err == nil && info.IsDir() {
+		finalLocalPath = filepath.Join(destination, filename)
+	}
+
+	file, err := os.Create(finalLocalPath)
+	if err != nil {
+		return fmt.Errorf("failed to create local file: %w", err)
 	}
 	defer file.Close()
 
-	// Set up stdout for session
-	stdout, err := session.StdoutPipe()
+	fmt.Fprint(stdin, "\x00")
+	_, err = io.Copy(file, io.LimitReader(stdout, size))
 	if err != nil {
-		return fmt.Errorf("failed to get stdout: %w", err)
+		return fmt.Errorf("failed during data transfer: %w", err)
 	}
 
-	// Start SCP command on remote
-	if err := session.Start(fmt.Sprintf("scp -f %s", source)); err != nil {
-		return fmt.Errorf("failed to start scp: %w", err)
+	finalBuf := make([]byte, 1)
+	_, _ = stdout.Read(finalBuf)
+
+	fmt.Fprint(stdin, "\x00")
+
+	stdin.Close()
+	return session.Wait()
+}
+
+// TODO: implement the user parsing
+func splitMachinePath(spec string) []string {
+	for i := 0; i < len(spec); i++ {
+		if spec[i] == ':' {
+			return []string{spec[:i], spec[i+1:]}
+		}
 	}
-
-	// Read file content
-	io.Copy(file, stdout)
-
-	// Wait for completion
-	if err := session.Wait(); err != nil {
-		return fmt.Errorf("scp failed: %w", err)
-	}
-
-	c.logger.Info("File downloaded successfully")
-	return nil
+	return []string{spec}
 }

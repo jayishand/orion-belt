@@ -19,6 +19,7 @@ type Config struct {
 type ServerConfig struct {
 	Host        string `yaml:"host"`
 	Port        int    `yaml:"port"`
+	APIPort     int    `yaml:"api_port,omitempty"`
 	SSHHostKey  string `yaml:"ssh_host_key,omitempty"`
 	APIEndpoint string `yaml:"api_endpoint,omitempty"`
 }

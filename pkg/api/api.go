@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/zrougamed/orion-belt/pkg/auth"
 	"github.com/zrougamed/orion-belt/pkg/common"
 	"github.com/zrougamed/orion-belt/pkg/database"
@@ -42,6 +45,14 @@ func NewAPIServer(store database.Store, authService *auth.AuthService, logger *c
 
 // setupRoutes configures all API routes
 func (s *APIServer) setupRoutes() {
+	// Health check endpoint
+	s.router.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"status":  "healthy",
+			"service": "orion-belt-api",
+		})
+	})
+
 	v1 := s.router.Group("/api/v1")
 
 	// Public endpoints
@@ -49,46 +60,72 @@ func (s *APIServer) setupRoutes() {
 	{
 		public.POST("/register/agent", s.registerAgent)
 		public.POST("/register/client", s.registerClient)
+		public.POST("/login", s.login)
 	}
 
-	// Protected endpoints (require authentication)
-	// TODO: implemet JWT or API keys
+	// Protected endpoints
+	// TODO: implemet password auth with machine registration
 	protected := v1.Group("/")
 	protected.Use(s.authMiddleware())
 	{
+		// Authentication & current user
+		protected.POST("/logout", s.logout)
+		protected.GET("/auth/me", s.getCurrentUser)
+
+		// API Key management
+		protected.POST("/api-keys", s.createAPIKey)
+		protected.GET("/api-keys", s.listAPIKeys)
+		protected.POST("/api-keys/:id/revoke", s.revokeAPIKey)
+		protected.DELETE("/api-keys/:id", s.deleteAPIKey)
+
 		// User management
 		protected.GET("/users", s.listUsers)
 		protected.GET("/users/:id", s.getUser)
-		protected.PUT("/users/:id", s.updateUser)
-		protected.DELETE("/users/:id", s.deleteUser)
 
 		// Machine management
 		protected.GET("/machines", s.listMachines)
 		protected.GET("/machines/:id", s.getMachine)
-		protected.POST("/machines", s.createMachine)
-		protected.PUT("/machines/:id", s.updateMachine)
-		protected.DELETE("/machines/:id", s.deleteMachine)
 
 		// Permission management
 		protected.GET("/permissions/user/:id", s.getUserPermissions)
 		protected.GET("/permissions/machine/:id", s.getMachinePermissions)
-		protected.POST("/permissions", s.grantPermission)
-		protected.DELETE("/permissions/:id", s.revokePermission)
 
 		// Access request management
 		protected.GET("/access-requests", s.listAccessRequests)
 		protected.GET("/access-requests/pending", s.listPendingAccessRequests)
 		protected.POST("/access-requests", s.createAccessRequest)
-		protected.POST("/access-requests/:id/approve", s.approveAccessRequest)
-		protected.POST("/access-requests/:id/reject", s.rejectAccessRequest)
 
 		// Session management
 		protected.GET("/sessions", s.listSessions)
 		protected.GET("/sessions/active", s.listActiveSessions)
 		protected.GET("/sessions/:id", s.getSession)
+		protected.GET("/sessions/:id/content", s.getSessionContent)
 
 		// Audit logs
 		protected.GET("/audit-logs", s.listAuditLogs)
+	}
+
+	// Admin-only endpoints
+	admin := v1.Group("/admin")
+	admin.Use(s.authMiddleware())
+	admin.Use(s.adminMiddleware())
+	{
+		// User management
+		admin.PUT("/users/:id", s.updateUser)
+		admin.DELETE("/users/:id", s.deleteUser)
+
+		// Machine management
+		admin.POST("/machines", s.createMachine)
+		admin.PUT("/machines/:id", s.updateMachine)
+		admin.DELETE("/machines/:id", s.deleteMachine)
+
+		// Permission management
+		admin.POST("/permissions", s.grantPermission)
+		admin.DELETE("/permissions/:id", s.revokePermission)
+
+		// Access request management
+		admin.POST("/access-requests/:id/approve", s.approveAccessRequest)
+		admin.POST("/access-requests/:id/reject", s.rejectAccessRequest)
 	}
 }
 
@@ -321,8 +358,13 @@ func (s *APIServer) listPendingAccessRequests(c *gin.Context) {
 
 // listAccessRequests lists access requests with pagination
 func (s *APIServer) listAccessRequests(c *gin.Context) {
-	// Implementation similar to other list endpoints
-	c.JSON(http.StatusOK, gin.H{"message": "not implemented yet"})
+	ctx := context.Background()
+	requests, err := s.store.ListPendingAccessRequests(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, requests)
 }
 
 // Placeholder implementations for other endpoints
@@ -375,14 +417,17 @@ func (s *APIServer) getMachine(c *gin.Context) {
 }
 
 func (s *APIServer) createMachine(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "not implemented yet"})
+	// TODO: implement machine registration
+	c.JSON(http.StatusOK, gin.H{"error": "not implemented yet"})
 }
 
 func (s *APIServer) updateMachine(c *gin.Context) {
+	// TODO: implement machine update
 	c.JSON(http.StatusOK, gin.H{"message": "not implemented yet"})
 }
 
 func (s *APIServer) deleteMachine(c *gin.Context) {
+	// TODO: implement machine archive and delete
 	c.JSON(http.StatusOK, gin.H{"message": "not implemented yet"})
 }
 
@@ -407,7 +452,36 @@ func (s *APIServer) getMachinePermissions(c *gin.Context) {
 }
 
 func (s *APIServer) grantPermission(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "not implemented yet"})
+	var req struct {
+		UserID     string `json:"user_id" binding:"required"`
+		MachineID  string `json:"machine_id" binding:"required"`
+		AccessType string `json:"access_type" binding:"required"` // 'ssh', 'scp', or 'both'
+		ExpiresAt  string `json:"expires_at"`                     // Optional
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// TODO: add proper checks with ReBac
+	adminID, _ := c.Get("user_id")
+
+	permission := &common.Permission{
+		ID:         uuid.New().String(),
+		UserID:     req.UserID,
+		MachineID:  req.MachineID,
+		AccessType: req.AccessType,
+		GrantedBy:  adminID.(string),
+		GrantedAt:  time.Now(),
+	}
+
+	if err := s.store.CreatePermission(context.Background(), permission); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, permission)
 }
 
 func (s *APIServer) revokePermission(c *gin.Context) {
@@ -420,7 +494,15 @@ func (s *APIServer) revokePermission(c *gin.Context) {
 }
 
 func (s *APIServer) listSessions(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "not implemented yet"})
+	ctx := context.Background()
+
+	sessions, err := s.store.ListActiveSessions(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, sessions)
 }
 
 func (s *APIServer) listActiveSessions(c *gin.Context) {
@@ -441,6 +523,23 @@ func (s *APIServer) getSession(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, session)
+}
+
+func (s *APIServer) getSessionContent(c *gin.Context) {
+	ctx := context.Background()
+	session, err := s.store.GetSession(ctx, c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+
+	// Ensure the recording exists on disk
+	if _, err := os.Stat(session.RecordingPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "recording file missing on server"})
+		return
+	}
+	// serve the file
+	c.File(session.RecordingPath)
 }
 
 func (s *APIServer) listAuditLogs(c *gin.Context) {

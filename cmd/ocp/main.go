@@ -63,7 +63,7 @@ func runSCP(cmd *cobra.Command, args []string) {
 	}
 
 	// Determine if upload or download
-	isUpload := !strings.Contains(source, "@")
+	isUpload := !strings.Contains(source, ":")
 
 	// Copy file
 	if err := scpClient.Copy(source, destination, isUpload); err != nil {

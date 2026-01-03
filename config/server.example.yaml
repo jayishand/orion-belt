@@ -1,7 +1,9 @@
 server:
   host: "0.0.0.0"
   port: 2222
+  api_port: 8080
   ssh_host_key: "/etc/orion-belt/ssh_host_key"
+  api_endpoint: "http://localhost:8080/api"
 
 database:
   driver: "postgres"
@@ -14,12 +16,15 @@ auth:
 recording:
   enabled: true
   storage_path: "/var/lib/orion-belt/recordings"
+  retention_days: 90
 
 plugins:
   notification:
     enabled: true
     smtp_host: "smtp.example.com"
     smtp_port: 587
+    smtp_user: "orion-belt@example.com"
+    smtp_password: "secret"
     from_email: "orion-belt@example.com"
     admin_emails:
       - "admin@example.com"

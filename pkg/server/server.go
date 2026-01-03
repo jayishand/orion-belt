@@ -6,9 +6,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/zrougamed/orion-belt/pkg/api"
 	"github.com/zrougamed/orion-belt/pkg/auth"
 	"github.com/zrougamed/orion-belt/pkg/common"
 	"github.com/zrougamed/orion-belt/pkg/database"
@@ -27,6 +29,7 @@ type Server struct {
 	logger        *common.Logger
 	sshConfig     *ssh.ServerConfig
 	listener      net.Listener
+	apiServer     *api.APIServer
 	agents        map[string]*AgentConnection
 	agentsMu      sync.RWMutex
 	shutdown      chan struct{}
@@ -64,6 +67,7 @@ func New(config *common.Config, logger *common.Logger) (*Server, error) {
 	authService := auth.NewAuthService(store, logger)
 
 	// Initialize recorder
+	// TODO: make the path relative to the bin folder ../recordings
 	recorder, err := recording.NewRecorder("/var/lib/orion-belt/recordings", logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create recorder: %w", err)
@@ -72,12 +76,16 @@ func New(config *common.Config, logger *common.Logger) (*Server, error) {
 	// Initialize plugin manager
 	pluginManager := plugin.NewManager(logger)
 
+	// Initialize API server
+	apiServer := api.NewAPIServer(store, authService, logger)
+
 	server := &Server{
 		config:        config,
 		store:         store,
 		authService:   authService,
 		recorder:      recorder,
 		pluginManager: pluginManager,
+		apiServer:     apiServer,
 		logger:        logger,
 		agents:        make(map[string]*AgentConnection),
 		shutdown:      make(chan struct{}),
@@ -120,6 +128,22 @@ func (s *Server) setupSSHConfig() error {
 
 // Start starts the SSH server
 func (s *Server) Start() error {
+	// Determine API port (default to 8080 if not configured)
+	apiPort := s.config.Server.APIPort
+	if apiPort == 0 {
+		apiPort = 8080
+	}
+
+	// Start API server in a goroutine
+	apiAddr := fmt.Sprintf("%s:%d", s.config.Server.Host, apiPort)
+	go func() {
+		s.logger.Info("Starting API server on %s", apiAddr)
+		if err := s.apiServer.Start(apiAddr); err != nil {
+			s.logger.Error("API server error: %v", err)
+		}
+	}()
+
+	// Start SSH server
 	addr := fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.Port)
 
 	listener, err := net.Listen("tcp", addr)
@@ -128,7 +152,7 @@ func (s *Server) Start() error {
 	}
 	s.listener = listener
 
-	s.logger.Info("Starting Orion-Belt server on %s", addr)
+	s.logger.Info("Starting Orion-Belt SSH server on %s", addr)
 
 	for {
 		select {
@@ -271,7 +295,7 @@ func (s *Server) handleAgentConnection(sshConn *ssh.ServerConn, chans <-chan ssh
 				continue
 			}
 
-			// Handle session requests (like agent-register, heartbeat)
+			// Handle session requests
 			go s.handleAgentSession(channel, requests, machine)
 		}
 	}()
@@ -324,6 +348,7 @@ func (s *Server) handleAgentSession(channel ssh.Channel, requests <-chan *ssh.Re
 				}
 				s.agentsMu.Unlock()
 				channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
+				channel.Close()
 			default:
 				req.Reply(false, nil)
 			}
@@ -409,12 +434,20 @@ func (s *Server) handleClientSession(channel ssh.Channel, requests <-chan *ssh.R
 }
 
 // proxyToMachine proxies a client session to a target machine through an agent
-func (s *Server) proxyToMachine(clientChannel ssh.Channel, machineName, userID, username string) {
+func (s *Server) proxyToMachine(clientChannel ssh.Channel, commandLine, userID, username string) {
 	ctx := context.Background()
 
-	s.logger.Info("proxyToMachine called: machine='%s', user='%s', userID='%s'", machineName, username, userID)
+	s.logger.Info("proxyToMachine called: commandLine='%s', user='%s', userID='%s'", commandLine, username, userID)
 
-	// Get machine
+	var machineName, remoteCommand string
+	parts := splitFirst(commandLine)
+	machineName = parts[0]
+	if len(parts) > 1 {
+		remoteCommand = parts[1]
+	}
+
+	s.logger.Info("Parsed: machine='%s', command='%s'", machineName, remoteCommand)
+
 	machine, err := s.store.GetMachineByName(ctx, machineName)
 	if err != nil {
 		s.logger.Error("Machine not found in database: %s (error: %v)", machineName, err)
@@ -445,7 +478,7 @@ func (s *Server) proxyToMachine(clientChannel ssh.Channel, machineName, userID, 
 	}
 
 	// Create session record
-	recordingPath := s.recorder.GetRecordingPath(fmt.Sprintf("%s-%d", userID, time.Now().Unix()))
+	recordingPath := s.recorder.GetRecordingStoragePath()
 	session := common.NewSession(userID, machine.ID, recordingPath)
 
 	if err := s.store.CreateSession(ctx, session); err != nil {
@@ -467,94 +500,175 @@ func (s *Server) proxyToMachine(clientChannel ssh.Channel, machineName, userID, 
 	}
 	s.pluginManager.TriggerHook(ctx, plugin.HookSessionStart, hookCtx)
 
-	// Open a direct-tcpip channel to the agent for SSH connection
-	// Note: The agent connected to us, so we have the reverse of typical client/server
-	// The agent's connection gives us a Conn that we can use to open channels
-	s.logger.Debug("Opening direct-tcpip channel to agent")
-	s.logger.Debug("Agent connection details - MachineID: %s", agentConn.MachineID)
-	s.logger.Debug("Agent SSHConn type: %T", agentConn.SSHConn)
-	s.logger.Debug("Agent SSHConn.Conn type: %T", agentConn.SSHConn.Conn)
+	s.logger.Info("Opening session channel to agent")
 
-	payload := ssh.Marshal(&struct {
-		DestAddr   string
-		DestPort   uint32
-		OriginAddr string
-		OriginPort uint32
-	}{
-		DestAddr:   "localhost",
-		DestPort:   22,
-		OriginAddr: "localhost",
-		OriginPort: 0,
-	})
-
-	s.logger.Debug("Payload marshalled, size: %d bytes", len(payload))
-	s.logger.Debug("Calling OpenChannel on agent connection...")
-
-	// ServerConn has a Conn() method that returns the underlying ssh.Conn
-	// which supports OpenChannel
-	agentChannel, agentReqs, err := agentConn.SSHConn.Conn.OpenChannel("direct-tcpip", payload)
+	agentChannel, agentReqs, err := agentConn.SSHConn.Conn.OpenChannel("session", nil)
 	if err != nil {
-		s.logger.Error("Failed to open direct-tcpip channel: %v", err)
-		s.logger.Error("Error type: %T", err)
+		s.logger.Error("Failed to open session channel: %v", err)
 		clientChannel.Write([]byte(fmt.Sprintf("Failed to connect to machine: %v\n", err)))
 		clientChannel.SendRequest("exit-status", false, []byte{0, 0, 0, 1})
 		return
 	}
-	defer agentChannel.Close()
 
-	s.logger.Info("Successfully opened direct-tcpip channel to agent")
+	s.logger.Info("Successfully opened session channel to agent")
 
-	// Forward agent requests to client channel
+	if remoteCommand != "" {
+		s.logger.Info("Executing command on agent: %s", remoteCommand)
+		if strings.Contains(remoteCommand, "scp") {
+			s.logger.Debug("Directing SCP command to agent: %s", remoteCommand)
+		}
+		s.executeCommand(clientChannel, agentChannel, agentReqs, remoteCommand, sessionRecorder)
+	} else {
+		s.logger.Info("Starting interactive shell on agent")
+		s.startInteractiveShell(clientChannel, agentChannel, agentReqs, sessionRecorder)
+	}
+
+	endTime := time.Now()
+	s.store.EndSession(ctx, session.ID, endTime)
+	s.recorder.StopRecording(session.ID)
+
+	s.pluginManager.TriggerHook(ctx, plugin.HookSessionEnd, hookCtx)
+
+	s.logger.Info("Session ended for user: %s", username)
+}
+
+func splitFirst(s string) []string {
+	for i := 0; i < len(s); i++ {
+		if s[i] == ' ' {
+			return []string{s[:i], s[i+1:]}
+		}
+	}
+	return []string{s}
+}
+
+func (s *Server) executeCommand(clientChannel, agentChannel ssh.Channel, agentReqs <-chan *ssh.Request, command string, recorder *recording.SessionRecorder) {
+	exitStatusReceived := make(chan struct{})
+
 	go func() {
 		for req := range agentReqs {
-			s.logger.Debug("Agent request: %s, wantReply: %v", req.Type, req.WantReply)
-
-			// Forward the request to the client
 			if req.Type == "exit-status" {
-				// Extract exit status and forward it
 				clientChannel.SendRequest("exit-status", false, req.Payload)
 				s.logger.Debug("Forwarded exit-status to client")
-			}
 
+				if req.WantReply {
+					req.Reply(true, nil)
+				}
+				close(exitStatusReceived)
+				continue
+			}
 			if req.WantReply {
 				req.Reply(true, nil)
 			}
 		}
 	}()
 
-	// Proxy the connection with recording
-	s.proxyConnection(clientChannel, agentChannel, sessionRecorder)
+	ok, err := agentChannel.SendRequest("exec", true, ssh.Marshal(&struct{ Command string }{command}))
+	if err != nil {
+		s.logger.Error("Failed to send exec request: %v", err)
+		clientChannel.Write([]byte(fmt.Sprintf("Failed to execute command: %v\n", err)))
+		clientChannel.SendRequest("exit-status", false, []byte{0, 0, 0, 1})
+		return
+	}
+	if !ok {
+		s.logger.Error("Exec request rejected by agent")
+		clientChannel.Write([]byte("Command execution rejected\n"))
+		clientChannel.SendRequest("exit-status", false, []byte{0, 0, 0, 1})
+		return
+	}
 
-	// End session
-	endTime := time.Now()
-	s.store.EndSession(ctx, session.ID, endTime)
-	s.recorder.StopRecording(session.ID)
+	s.logger.Info("Command execution started on agent")
 
-	// Trigger session end hook
-	s.pluginManager.TriggerHook(ctx, plugin.HookSessionEnd, hookCtx)
+	s.proxyConnection(clientChannel, agentChannel, recorder, true)
 
-	s.logger.Info("Session ended for user: %s", username)
+	select {
+	case <-exitStatusReceived:
+		s.logger.Info("Exit status received and forwarded successfully")
+	case <-time.After(5 * time.Second):
+		s.logger.Warn("Timeout waiting for exit status")
+		clientChannel.SendRequest("exit-status", false, []byte{0, 0, 0, 1})
+	}
+
+	clientChannel.CloseWrite()
+}
+
+func (s *Server) startInteractiveShell(clientChannel, agentChannel ssh.Channel, agentReqs <-chan *ssh.Request, recorder *recording.SessionRecorder) {
+	statusDone := make(chan struct{})
+	var once sync.Once
+	go func() {
+		for req := range agentReqs {
+			switch req.Type {
+			case "exit-status":
+				once.Do(func() {
+					clientChannel.SendRequest("exit-status", false, req.Payload)
+					s.logger.Debug("Forwarded exit-status to client")
+					close(statusDone)
+				})
+			default:
+				if req.WantReply {
+					req.Reply(true, nil)
+				}
+			}
+		}
+	}()
+
+	ok, err := agentChannel.SendRequest("shell", true, nil)
+	if err != nil || !ok {
+		s.logger.Error("Shell request failed")
+		return
+	}
+
+	s.logger.Info("Interactive shell started on agent")
+
+	s.proxyConnection(clientChannel, agentChannel, recorder, false)
+
+	select {
+	case <-statusDone:
+		s.logger.Debug("Exit status confirmed")
+	case <-time.After(1 * time.Second):
+		s.logger.Warn("Timed out waiting for exit status")
+	}
+
+	agentChannel.Close()
+	clientChannel.Close()
 }
 
 // proxyConnection proxies data between client and agent with recording
-func (s *Server) proxyConnection(client, agent ssh.Channel, recorder *recording.SessionRecorder) {
+func (s *Server) proxyConnection(client, agent ssh.Channel, recorder *recording.SessionRecorder, waitBoth bool) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	done := make(chan struct{}, 2)
 
 	// Client -> Agent
 	go func() {
+		defer wg.Done()
 		reader := recording.NewRecordingReader(client, recorder)
 		io.Copy(agent, reader)
+
+		if cw, ok := agent.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
+		s.logger.Debug("Client -> Agent I/O closed")
 		done <- struct{}{}
 	}()
 
 	// Agent -> Client
 	go func() {
+		defer wg.Done()
 		writer := recording.NewRecordingWriter(client, recorder)
 		io.Copy(writer, agent)
+
+		client.CloseWrite()
+		s.logger.Debug("Agent -> Client I/O closed")
 		done <- struct{}{}
 	}()
 
-	<-done
+	if waitBoth {
+		wg.Wait()
+	} else {
+		<-done
+		s.logger.Debug("First I/O direction finished, stopping proxy for shell")
+	}
 }
 
 // Stop stops the SSH server

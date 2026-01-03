@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/creack/pty"
@@ -99,14 +100,12 @@ func (a *Agent) connectToServer() error {
 		return fmt.Errorf("failed to establish SSH connection: %w", err)
 	}
 
-	// Store the connection - we'll use this for heartbeats
+	// Store the connection
 	a.sshConn = sshConn
 	a.logger.Info("Connected to server: %s", serverAddr)
 
 	a.logger.Debug("Setting up channel handlers...")
 
-	// Handle incoming channel requests from server (for direct-tcpip)
-	// IMPORTANT: We must handle these ourselves, not let ssh.NewClient consume them
 	go a.handleChannels(chans)
 
 	a.logger.Debug("Channel handler started")
@@ -116,9 +115,6 @@ func (a *Agent) connectToServer() error {
 
 	a.logger.Debug("Global request handler started")
 
-	// Start listening for connections
-	go a.listenForConnections()
-
 	a.logger.Debug("Agent fully initialized and ready")
 
 	return nil
@@ -127,120 +123,144 @@ func (a *Agent) connectToServer() error {
 // handleChannels handles incoming channel requests from the server
 func (a *Agent) handleChannels(chans <-chan gossh.NewChannel) {
 	a.logger.Info("handleChannels started - waiting for incoming channels...")
-	channelCount := 0
 	for newChannel := range chans {
-		channelCount++
-		a.logger.Info("=== Received channel #%d ===", channelCount)
-		go a.handleChannel(newChannel)
+		a.logger.Info("Received channel type: %s", newChannel.ChannelType())
+
+		if newChannel.ChannelType() != "session" {
+			a.logger.Warn("Rejecting non-session channel: %s", newChannel.ChannelType())
+			newChannel.Reject(gossh.UnknownChannelType, "only session channels supported")
+			continue
+		}
+
+		go a.handleSession(newChannel)
 	}
-	a.logger.Warn("handleChannels exiting - channel closed")
+	a.logger.Warn("Channel handler exiting")
 }
 
-// handleChannel handles a single channel request
-func (a *Agent) handleChannel(newChannel gossh.NewChannel) {
-	a.logger.Info(">>> handleChannel called")
-	a.logger.Info(">>> Channel type: %s", newChannel.ChannelType())
-	a.logger.Debug(">>> Channel extra data length: %d bytes", len(newChannel.ExtraData()))
+// handleSession handles a single session request
+func (a *Agent) handleSession(newChannel gossh.NewChannel) {
+	a.logger.Info("Accepting session channel")
 
-	// Accept the channel first
-	a.logger.Debug(">>> Accepting channel...")
 	channel, requests, err := newChannel.Accept()
 	if err != nil {
-		a.logger.Error("!!! Failed to accept channel: %v", err)
-		return
-	}
-	a.logger.Info(">>> Channel accepted successfully")
-
-	// Handle based on channel type
-	a.logger.Debug(">>> Routing to handler based on type: %s", newChannel.ChannelType())
-	switch newChannel.ChannelType() {
-	case "direct-tcpip":
-		a.logger.Info(">>> Routing to handleDirectTCPIP")
-		a.handleDirectTCPIP(channel, requests, newChannel.ExtraData())
-	case "session":
-		a.logger.Info(">>> Routing to handleSessionChannel")
-		a.handleSessionChannel(channel, requests)
-	default:
-		a.logger.Warn(">>> Unsupported channel type: %s", newChannel.ChannelType())
-		return
-	}
-	a.logger.Info(">>> handleChannel completed")
-}
-
-// handleDirectTCPIP handles direct-tcpip channel (SSH connection forwarding)
-func (a *Agent) handleDirectTCPIP(channel gossh.Channel, requests <-chan *gossh.Request, extraData []byte) {
-	// Parse the channel request
-	var directTCPIPMsg struct {
-		DestAddr   string
-		DestPort   uint32
-		OriginAddr string
-		OriginPort uint32
-	}
-
-	if err := gossh.Unmarshal(extraData, &directTCPIPMsg); err != nil {
-		a.logger.Error("Failed to parse direct-tcpip request: %v", err)
+		a.logger.Error("Failed to accept channel: %v", err)
 		return
 	}
 
-	a.logger.Info("direct-tcpip request to %s:%d - starting interactive shell with PTY", directTCPIPMsg.DestAddr, directTCPIPMsg.DestPort)
+	a.logger.Info("Session channel accepted, waiting for requests...")
 
-	// Handle PTY requests
-	go func() {
-		for req := range requests {
-			a.logger.Debug("Channel request: %s", req.Type)
+	var ptyReq *ptyRequestMsg
+	var execCommand string
+
+	for req := range requests {
+		a.logger.Debug("Session request: %s", req.Type)
+
+		switch req.Type {
+		case "pty-req":
+			ptyReq = &ptyRequestMsg{}
+			if err := gossh.Unmarshal(req.Payload, ptyReq); err != nil {
+				a.logger.Error("Failed to parse pty-req: %v", err)
+				req.Reply(false, nil)
+			} else {
+				a.logger.Info("PTY requested: %s %dx%d", ptyReq.Term, ptyReq.Columns, ptyReq.Rows)
+				req.Reply(true, nil)
+			}
+
+		case "shell":
+			a.logger.Info("Shell requested")
+
+			req.Reply(true, nil)
+
+			a.startShell(channel, ptyReq)
+			channel.Close()
+			return
+
+		case "exec":
+			var payload struct {
+				Command string
+			}
+			if err := gossh.Unmarshal(req.Payload, &payload); err != nil {
+				a.logger.Error("Failed to parse exec payload: %v", err)
+				req.Reply(false, nil)
+				continue
+			}
+
+			execCommand = payload.Command
+			a.logger.Info("Exec requested: %s", execCommand)
+			req.Reply(true, nil)
+
+			a.executeCommand(channel, execCommand)
+			return
+
+		case "env":
+			req.Reply(true, nil)
+
+		default:
+			a.logger.Debug("Unsupported request: %s", req.Type)
 			if req.WantReply {
-				req.Reply(true, nil) // Accept all requests
+				req.Reply(false, nil)
 			}
 		}
-	}()
+	}
 
-	// Send welcome message
-	channel.Write([]byte(fmt.Sprintf("=== Connected to %s ===\r\n", a.config.Agent.Name)))
+	a.logger.Info("Session ended without exec or shell request")
+	channel.Close()
+}
 
-	// Start shell with PTY
-	a.logger.Info("Starting interactive shell with PTY...")
+type ptyRequestMsg struct {
+	Term     string
+	Columns  uint32
+	Rows     uint32
+	Width    uint32
+	Height   uint32
+	Modelist string
+}
 
-	// Use /bin/sh for Alpine Linux compatibility
-	cmd := exec.Command("/bin/sh")
+func (a *Agent) startShell(channel gossh.Channel, ptyReq *ptyRequestMsg) {
+	a.logger.Info("Starting interactive shell")
+
+	cmd := exec.Command("/bin/sh") // TODO: work on enriching this capability
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
-	// Start the command with a PTY
+	if ptyReq != nil {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
+	}
+
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		a.logger.Error("Failed to start shell with PTY: %v", err)
 		channel.Write([]byte(fmt.Sprintf("Failed to start shell: %v\r\n", err)))
+		a.sendExitStatus(channel, 1)
 		return
 	}
 	defer ptmx.Close()
 
+	if ptyReq != nil {
+		pty.Setsize(ptmx, &pty.Winsize{
+			Rows: uint16(ptyReq.Rows),
+			Cols: uint16(ptyReq.Columns),
+		})
+	}
+
 	a.logger.Info("Shell started with PTY (PID: %d)", cmd.Process.Pid)
 
-	// Copy I/O between channel and PTY
-	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// PTY -> Channel (reads from PTY, writes to channel)
 	go func() {
+		defer wg.Done()
 		io.Copy(channel, ptmx)
 		a.logger.Debug("PTY->Channel copy finished")
-		// Signal that we're done
-		done <- struct{}{}
+		channel.CloseWrite()
 	}()
 
-	// Channel -> PTY (reads from channel, writes to PTY)
 	go func() {
+		defer wg.Done()
 		io.Copy(ptmx, channel)
 		a.logger.Debug("Channel->PTY copy finished")
 	}()
 
-	// Wait for PTY->Channel to finish (this happens when shell exits and PTY closes)
-	<-done
-
-	// Close PTY to break the Channel->PTY copy
-	ptmx.Close()
-
-	a.logger.Debug("I/O copy completed, waiting for shell to exit...")
-
-	// Wait for shell process to exit
+	// Wait for PTY->Channel to finish
 	err = cmd.Wait()
 
 	// Send exit status to client
@@ -252,74 +272,114 @@ func (a *Agent) handleDirectTCPIP(channel gossh.Channel, requests <-chan *gossh.
 		} else {
 			exitStatus = 1
 		}
-	} else {
-		a.logger.Info("Shell exited successfully")
 	}
-
 	// Send exit-status request
-	statusMsg := make([]byte, 4)
-	statusMsg[0] = byte(exitStatus >> 24)
-	statusMsg[1] = byte(exitStatus >> 16)
-	statusMsg[2] = byte(exitStatus >> 8)
-	statusMsg[3] = byte(exitStatus)
+	a.sendExitStatus(channel, exitStatus)
 
-	_, err = channel.SendRequest("exit-status", false, statusMsg)
+	// Close the channel
+	ptmx.Close()
+	channel.CloseWrite()
+	wg.Wait()
 
-	// Close the channel now that we're done
+	a.logger.Debug("Closing channel after shell completion")
 	channel.Close()
-	a.logger.Debug("handleDirectTCPIP completed")
 }
 
-// handleSessionChannel handles session channel
-func (a *Agent) handleSessionChannel(channel gossh.Channel, requests <-chan *gossh.Request) {
-	a.logger.Info("Session channel opened")
+func (a *Agent) executeCommand(channel gossh.Channel, command string) {
+	a.logger.Info("Executing command: %s", command)
 
-	// Handle session requests
-	for req := range requests {
-		switch req.Type {
-		case "exec":
-			// Handle exec requests
-			var payload struct {
-				Command string
-			}
-			if err := gossh.Unmarshal(req.Payload, &payload); err != nil {
-				req.Reply(false, nil)
-				continue
-			}
+	cmd := exec.Command("/bin/sh", "-c", command)
+	cmd.Env = os.Environ()
 
-			a.logger.Debug("Exec request: %s", payload.Command)
-
-			// Handle specific commands
-			switch payload.Command {
-			case "heartbeat":
-				req.Reply(true, nil)
-				channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
-			default:
-				req.Reply(false, nil)
-			}
-
-		default:
-			if req.WantReply {
-				req.Reply(false, nil)
-			}
-		}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		a.logger.Error("Failed to get stdin pipe: %v", err)
+		channel.Write([]byte(fmt.Sprintf("Failed to execute command: %v\n", err)))
+		a.sendExitStatus(channel, 1)
+		return
 	}
 
-	// Close the channel when done
-	channel.Close()
-	a.logger.Debug("handleSessionChannel completed")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		a.logger.Error("Failed to get stdout pipe: %v", err)
+		channel.Write([]byte(fmt.Sprintf("Failed to execute command: %v\n", err)))
+		a.sendExitStatus(channel, 1)
+		return
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		a.logger.Error("Failed to get stderr pipe: %v", err)
+		channel.Write([]byte(fmt.Sprintf("Failed to execute command: %v\n", err)))
+		a.sendExitStatus(channel, 1)
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		a.logger.Error("Failed to start command: %v", err)
+		channel.Write([]byte(fmt.Sprintf("Failed to execute command: %v\n", err)))
+		a.sendExitStatus(channel, 1)
+		return
+	}
+
+	a.logger.Info("Command started (PID: %d)", cmd.Process.Pid)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		io.Copy(stdin, channel)
+		stdin.Close()
+		a.logger.Debug("Channel->stdin copy finished")
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(channel, stdout)
+		a.logger.Debug("stdout->Channel copy finished")
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(channel.Stderr(), stderr)
+		a.logger.Debug("stderr->Channel copy finished")
+	}()
+
+	cmdErr := cmd.Wait()
+	a.logger.Debug("Command process finished, waiting for output I/O to complete")
+
+	wg.Wait()
+	a.logger.Debug("All output I/O finished")
+
+	exitStatus := 0
+	if cmdErr != nil {
+		if exitErr, ok := cmdErr.(*exec.ExitError); ok {
+			exitStatus = exitErr.ExitCode()
+		} else {
+			exitStatus = 1
+		}
+		a.logger.Info("Command exited with error: %v (status: %d)", cmdErr, exitStatus)
+	} else {
+		a.logger.Info("Command exited successfully")
+	}
+
+	a.sendExitStatus(channel, exitStatus)
+	a.logger.Debug("Closing write side of channel after command completion")
+	channel.CloseWrite()
 }
 
-// listenForConnections keeps the SSH connection alive
-func (a *Agent) listenForConnections() {
-	a.logger.Info("Agent connected and ready - waiting for client connections...")
+func (a *Agent) sendExitStatus(channel gossh.Channel, status int) {
+	statusMsg := make([]byte, 4)
+	statusMsg[0] = byte(status >> 24)
+	statusMsg[1] = byte(status >> 16)
+	statusMsg[2] = byte(status >> 8)
+	statusMsg[3] = byte(status)
 
-	// The connection is kept alive by the heartbeat loop in Start()
-	// Server automatically registers the agent when it detects the connection
-	// Server will use direct-tcpip channels to forward client connections
+	ok, err := channel.SendRequest("exit-status", true, statusMsg)
+	if err != nil || !ok {
+		a.logger.Warn("Failed to send exit status (ack: %v, err: %v)", ok, err)
+	} else {
+		a.logger.Debug("Sent exit status: %d and received ACK", status)
+	}
 }
 
-// sendHeartbeat sends a heartbeat to the server
 func (a *Agent) sendHeartbeat() error {
 	if a.sshConn == nil {
 		return fmt.Errorf("not connected to server")
@@ -332,7 +392,6 @@ func (a *Agent) sendHeartbeat() error {
 	}
 	defer channel.Close()
 
-	// Discard requests
 	go gossh.DiscardRequests(reqs)
 
 	// Send exec request
@@ -356,16 +415,4 @@ func (a *Agent) Stop(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-// TODO: to be implemented with server commands
-// executeCommand executes a shell command
-func (a *Agent) executeCommand(command string) (string, error) {
-	cmd := exec.Command("sh", "-c", command)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("command failed: %w", err)
-	}
-
-	return string(output), nil
 }

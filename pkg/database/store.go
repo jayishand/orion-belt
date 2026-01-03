@@ -53,6 +53,23 @@ type Store interface {
 	CreateAuditLog(ctx context.Context, log *common.AuditLog) error
 	ListAuditLogs(ctx context.Context, limit, offset int, filters map[string]interface{}) ([]*common.AuditLog, error)
 
+	// API Key operations
+	CreateAPIKey(ctx context.Context, key *common.APIKey) error
+	GetAPIKey(ctx context.Context, id string) (*common.APIKey, error)
+	GetAPIKeyByHash(ctx context.Context, keyHash string) (*common.APIKey, error)
+	ListUserAPIKeys(ctx context.Context, userID string) ([]*common.APIKey, error)
+	UpdateAPIKeyLastUsed(ctx context.Context, id string, lastUsedAt time.Time) error
+	RevokeAPIKey(ctx context.Context, id string) error
+	DeleteAPIKey(ctx context.Context, id string) error
+
+	// HTTP Session operations
+	CreateHTTPSession(ctx context.Context, session *common.HTTPSession) error
+	GetHTTPSession(ctx context.Context, id string) (*common.HTTPSession, error)
+	GetHTTPSessionByToken(ctx context.Context, tokenHash string) (*common.HTTPSession, error)
+	UpdateHTTPSessionLastSeen(ctx context.Context, id string, lastSeenAt time.Time) error
+	DeleteHTTPSession(ctx context.Context, id string) error
+	DeleteExpiredHTTPSessions(ctx context.Context) error
+
 	// Lifecycle
 	Connect(ctx context.Context) error
 	Close() error
